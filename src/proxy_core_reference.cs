@@ -489,6 +489,21 @@ internal static class ProxyCore
             return 1;
         }
 
+        // 目标服务器和代理服务器填成同一个，几乎肯定把 MC 服务器当代理了
+        if (string.Equals(tHost, pIp, StringComparison.OrdinalIgnoreCase) && tPort == pPort)
+        {
+            Log("");
+            Log("[X] 「目标服务器」和「SOCKS5代理」填成了同一个地址: " + tHost + ":" + tPort);
+            Log("");
+            Log("    目标服务器 = 你要玩的 Minecraft 服务器，比如 colorgarden.top:55555");
+            Log("    SOCKS5代理 = 你自己的代理服务器，通常是另一台机器，比如 1.2.3.4:1080");
+            Log("");
+            Log("    如果你想直连这个 MC 服务器，根本不需要本程序，直接用游戏连就行。");
+            Log("    如果你想通过代理连，需要先有一个 SOCKS5 代理服务。");
+            Pause("");
+            return 1;
+        }
+
         if (!Start(st, tHost, tPort, pIp, pPort, user, pass))
         {
             Pause("常见原因：\n"

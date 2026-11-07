@@ -755,6 +755,22 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // 目标服务器和代理服务器填成同一个，几乎肯定把 MC 服务器当代理了
+    if (tHost == pIp && tPort == pPort)
+    {
+        log_line("");
+        log_line("[X] 「目标服务器」和「SOCKS5代理」填成了同一个地址: " + tHost + ":" + std::to_string(tPort));
+        log_line("");
+        log_line("    目标服务器 = 你要玩的 Minecraft 服务器，比如 colorgarden.top:55555");
+        log_line("    SOCKS5代理 = 你自己的代理服务器，通常是另一台机器，比如 1.2.3.4:1080");
+        log_line("");
+        log_line("    如果你想直连这个 MC 服务器，根本不需要本程序，直接用游戏连就行。");
+        log_line("    如果你想通过代理连，需要先有一个 SOCKS5 代理服务。");
+        pause_exit("");
+        net_done();
+        return 1;
+    }
+
     if (!start_proxy(&st, tHost, tPort, pIp, pPort, user, pass))
     {
         pause_exit("常见原因：\n"
