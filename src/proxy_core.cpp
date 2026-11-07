@@ -11,35 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 // ============================================================================
-//  LeaveH 代理核心（从 Leave IPban Beta 2.7 Fix.exe 反编译还原）
-//  ---------------------------------------------------------------------------
+//  MinecraftWebProxy —— SOCKS5 代理转发核心
+// ---------------------------------------------------------------------------
 //  跨平台：Windows (winsock2) / Linux (POSIX socket)
-//  可单独编译成 exe / elf，不依赖原程序。
 //
-//  编译示例：
-//    Windows (zig):
-//      zig c++ -target x86_64-windows-gnu -O2 -std=c++17 proxy_core.cpp -o proxy_core.exe -lws2_32
-//    Windows (MinGW):
-//      g++ -O2 -std=c++17 proxy_core.cpp -o proxy_core.exe -lws2_32 -static
-//    Linux x86_64:
-//      g++ -O2 -std=c++17 proxy_core.cpp -o proxy_core -static -lpthread
-//    Linux ARM64（交叉）:
-//      zig c++ -target aarch64-linux-musl -O2 -std=c++17 proxy_core.cpp -o proxy_core_arm64 -static -lpthread
-//
-//  原程序对应地址（ImageBase = 0x140000000）：
-//    FUN_140035490  socks5_connect()        SOCKS5 握手 + CONNECT
-//    FUN_140034580  listener_thread()       本地监听 / accept 循环
-//    FUN_140035330  relay_down()            upstream -> client 转发
-//    FUN_1400e4300  relay_up()              client -> upstream 转发
-//    FUN_1400396b0  start_custom_proxy()    “使用自定义代理”入口
-//    FUN_14003b070  hosts_add_entry()       写 hosts（# MC_PROXY）
-//    FUN_140033d00  hosts_remove_entries()  清理 hosts
-//
-//  改动（相对原版）：
-//    * 账号密码留空时，握手只申报“无认证”，不再走用户名密码认证；
-//      用户名或密码填了任意一个，才申报“用户名密码”。
-//    * 监听循环超时由 {0,0} 改为 10ms，避免忙等占满 CPU。
+//  用法：
+//    proxy_core                                  交互输入
+//    proxy_core <目标> <目标端口> <代理IP> <代理端口> [用户] [密码]
 // ============================================================================
 
 #ifdef _WIN32
@@ -156,17 +136,14 @@ static int net_recv(net_sock s, void* buf, int len)
 
 // ===========================================================================
 //  控制台输出编码适配
-//  Windows 控制台默认是 GBK(936)，直接输出 UTF-8 字节会变成乱码。
-//  这里先把控制台代码页切成 UTF-8；若切换不生效，再把文本转成当前
-//  代码页输出，保证任何控制台下都不乱码。
+//  Windows 控制台默认 GBK(936)，直接输出 UTF-8 会乱码。
+//  控制台 -> 转当前代码页；重定向 -> 原样 UTF-8。
 // ===========================================================================
 #ifdef _WIN32
 static bool g_console_utf8 = true;
 
 static void console_init()
 {
-    // stdout 是控制台时按控制台代码页输出（通常是 GBK/936），
-    // 被重定向到文件或管道时按 UTF-8 原样输出。
     DWORD mode = 0;
     bool isConsole = (::GetConsoleMode(::GetStdHandle(STD_OUTPUT_HANDLE), &mode) != 0);
     g_console_utf8 = (!isConsole) || (::GetConsoleOutputCP() == 65001);
@@ -182,20 +159,12 @@ static void out_text(const char* utf8)
 
     UINT cp = ::GetConsoleOutputCP();
     int wlen = ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
-    if (wlen <= 1)
-    {
-        std::fputs(utf8, stdout);
-        return;
-    }
+    if (wlen <= 1) { std::fputs(utf8, stdout); return; }
     std::vector<wchar_t> w((size_t)wlen);
     ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w.data(), wlen);
 
     int alen = ::WideCharToMultiByte(cp, 0, w.data(), -1, nullptr, 0, nullptr, nullptr);
-    if (alen <= 1)
-    {
-        std::fputs(utf8, stdout);
-        return;
-    }
+    if (alen <= 1) { std::fputs(utf8, stdout); return; }
     std::vector<char> a((size_t)alen);
     ::WideCharToMultiByte(cp, 0, w.data(), -1, a.data(), alen, nullptr, nullptr);
     std::fputs(a.data(), stdout);
@@ -211,29 +180,45 @@ static void out_text(const char* utf8)
 
 #endif
 
-// ===========================================================================
-//  代理状态（对应原程序 ProxyState 对象，字段偏移见注释）
-// ===========================================================================
-struct ProxyState
-{
-    std::atomic<bool> running{ false };           // +0x00 运行标志
-    net_sock          listenSock{ kInvalidSock }; // +0x18 监听 socket
-    std::string       proxyIp;                    // +0x20 代理服务器 IP / 域名
-    std::string       proxyUser;                  // +0x40 代理用户名
-    std::string       proxyPass;                  // +0x60 代理密码
-    std::string       targetHost;                 // +0x80 目标服务器
-    int               proxyPort{ 0 };             // +0xa0 代理端口
-    int               targetPort{ 0 };            // +0xa4 目标端口
-    int               listenPort{ 25565 };        // +0xa8 本地监听端口
-    std::atomic<int>  connCount{ 0 };             // +0xac 当前连接数
-};
-
 static void log_line(const std::string& s)
 {
     out_text(s.c_str());
     out_text("\n");
     std::fflush(stdout);
 }
+
+static void pause_exit(const std::string& hint)
+{
+    out_text("\n");
+    if (!hint.empty())
+    {
+        out_text(hint.c_str());
+        out_text("\n");
+    }
+    out_text("按任意键退出...\n");
+    std::fflush(stdout);
+    // 清掉行缓冲里剩余内容，再等一个字符
+    std::cin.clear();
+    std::cin.sync();
+    std::cin.get();
+}
+
+// ===========================================================================
+//  代理状态
+// ===========================================================================
+struct ProxyState
+{
+    std::atomic<bool> running{ false };
+    net_sock          listenSock{ kInvalidSock };
+    std::string       proxyIp;
+    std::string       proxyUser;
+    std::string       proxyPass;
+    std::string       targetHost;
+    int               proxyPort{ 0 };
+    int               targetPort{ 0 };
+    int               listenPort{ 25565 };
+    std::atomic<int>  connCount{ 0 };
+};
 
 static const char* socks5_reply_text(unsigned char rep)
 {
@@ -259,24 +244,22 @@ static std::string hex2(unsigned int v)
 }
 
 // ---------------------------------------------------------------------------
-//  socks5_connect —— 对应 FUN_140035490
-//
-//  认证方式申报规则（本次改动）：
-//    账号、密码都为空   -> 只报 { 05, 01, 00 }         （只支持无认证）
-//    有任意一个非空     -> 报 { 05, 02, 00, 02 }       （无认证 / 用户名密码）
+//  socks5_connect
+//    err 非空时写入失败原因
+//    账号密码都空 -> 只申报无认证；有任意一个非空 -> 申报无认证 + 用户名密码
 // ---------------------------------------------------------------------------
-static net_sock socks5_connect(const ProxyState& st)
+static net_sock socks5_connect(const ProxyState& st, std::string* err)
 {
     const bool useAuth = !st.proxyUser.empty() || !st.proxyPass.empty();
 
     net_sock s = ::socket(AF_INET, SOCK_STREAM, 0);
     if (s == kInvalidSock)
     {
-        log_line(std::string("[DEBUG] 创建socket失败: ") + std::to_string(net_err()));
+        if (err) *err = "创建 socket 失败: " + std::to_string(net_err());
         return kInvalidSock;
     }
 
-    net_set_timeout(s, 10000);                 // 原程序：收/发超时 10 秒
+    net_set_timeout(s, 10000);
 
     addrinfo hints;
     std::memset(&hints, 0, sizeof(hints));
@@ -288,8 +271,7 @@ static net_sock socks5_connect(const ProxyState& st)
     int rc = ::getaddrinfo(st.proxyIp.c_str(), portStr.c_str(), &hints, &res);
     if (rc != 0 || res == nullptr)
     {
-        log_line(std::string("[DEBUG] 解析代理地址 ") + st.proxyIp +
-                 " 失败, 错误码: " + std::to_string(rc));
+        if (err) *err = "代理地址解析失败: " + st.proxyIp + " (code " + std::to_string(rc) + ")";
         net_close(s);
         return kInvalidSock;
     }
@@ -297,8 +279,8 @@ static net_sock socks5_connect(const ProxyState& st)
     rc = ::connect(s, res->ai_addr, (int)res->ai_addrlen);
     if (rc != 0)
     {
-        log_line("[DEBUG] 连接代理服务器 " + st.proxyIp + ":" + portStr +
-                 " 失败, 错误码: " + std::to_string(net_err()));
+        if (err) *err = "连不上代理服务器 " + st.proxyIp + ":" + portStr +
+                        " (code " + std::to_string(net_err()) + ")";
         ::freeaddrinfo(res);
         net_close(s);
         return kInvalidSock;
@@ -321,35 +303,43 @@ static net_sock socks5_connect(const ProxyState& st)
 
     if (net_send(s, hello, helloLen) != helloLen)
     {
-        log_line("[DEBUG] 发送握手数据失败");
+        if (err) *err = "发送握手数据失败";
         net_close(s);
         return kInvalidSock;
     }
 
     unsigned char resp[2] = { 0, 0 };
     int n = net_recv(s, resp, 2);
-    if (n != 2 || resp[0] != 0x05)
+    if (n < 2)
     {
-        log_line("[DEBUG] 握手响应无效, 收到 " + std::to_string(n) + " 字节");
+        if (err) *err = "代理服务器没有回应 SOCKS5 握手（收到 " + std::to_string(n) +
+                        " 字节），这个地址端口可能不是 SOCKS5 代理";
+        net_close(s);
+        return kInvalidSock;
+    }
+    if (resp[0] != 0x05)
+    {
+        if (err) *err = "对端不是 SOCKS5 代理（VER=" + hex2(resp[0]) +
+                        "），这个地址端口大概填错了";
         net_close(s);
         return kInvalidSock;
     }
 
     if (resp[1] == 0xFF)
     {
-        log_line("[DEBUG] 代理服务器拒绝所有请求的认证方法 (0xFF)");
+        if (err) *err = "代理服务器拒绝所有认证方法 (0xFF)";
         net_close(s);
         return kInvalidSock;
     }
     if (resp[1] == 0x02 && !useAuth)
     {
-        log_line("[DEBUG] 代理服务器要求用户名密码，但未填写账号密码");
+        if (err) *err = "代理服务器要求用户名密码，但没填账号密码";
         net_close(s);
         return kInvalidSock;
     }
     if (resp[1] != 0x00 && resp[1] != 0x02)
     {
-        log_line("[DEBUG] 代理服务器选择了不支持的认证方法: " + hex2(resp[1]));
+        if (err) *err = "代理服务器选中了不支持的认证方法: " + hex2(resp[1]);
         net_close(s);
         return kInvalidSock;
     }
@@ -366,7 +356,7 @@ static net_sock socks5_connect(const ProxyState& st)
 
         if (net_send(s, auth.data(), (int)auth.size()) != (int)auth.size())
         {
-            log_line("[DEBUG] 发送认证数据失败");
+            if (err) *err = "发送认证数据失败";
             net_close(s);
             return kInvalidSock;
         }
@@ -375,13 +365,20 @@ static net_sock socks5_connect(const ProxyState& st)
         n = net_recv(s, ack, 2);
         if (n != 2 || ack[1] != 0x00)
         {
-            log_line("[DEBUG] 认证失败, 响应: " + std::to_string(n) + " 字节");
+            if (err) *err = "代理用户名或密码错误";
             net_close(s);
             return kInvalidSock;
         }
     }
 
-    // ---- 3. CONNECT（原程序固定用 ATYP=0x03 域名方式）----------------------
+    // ---- 3. CONNECT（固定 ATYP=0x03 域名方式）------------------------------
+    if (st.targetHost.empty() || st.targetHost.size() > 255)
+    {
+        if (err) *err = "目标地址为空或太长（上限 255 字节）";
+        net_close(s);
+        return kInvalidSock;
+    }
+
     std::vector<unsigned char> req;
     req.push_back(0x05);
     req.push_back(0x01);
@@ -394,7 +391,7 @@ static net_sock socks5_connect(const ProxyState& st)
 
     if (net_send(s, req.data(), (int)req.size()) != (int)req.size())
     {
-        log_line("[DEBUG] 发送CONNECT请求失败");
+        if (err) *err = "发送 CONNECT 请求失败";
         net_close(s);
         return kInvalidSock;
     }
@@ -405,21 +402,24 @@ static net_sock socks5_connect(const ProxyState& st)
     while (n < 4)
     {
         int r = net_recv(s, head + n, 4 - n);
-        if (r < 1)
-        {
-            log_line("[DEBUG] 读取CONNECT响应头失败, 已读 " + std::to_string(n));
-            net_close(s);
-            return kInvalidSock;
-        }
+        if (r < 1) break;
         n += r;
+    }
+    if (n != 4)
+    {
+        if (err) *err = "读取 CONNECT 回复失败（" + std::to_string(n) + "/4 字节）";
+        net_close(s);
+        return kInvalidSock;
     }
 
     if (head[1] != 0x00)
     {
-        std::string msg = "[DEBUG] CONNECT请求被拒绝, 错误码: " + hex2(head[1]);
+        std::string msg = "代理拒绝了到 " + st.targetHost + ":" + std::to_string(st.targetPort) +
+                          " 的 CONNECT（错误码 " + hex2(head[1]);
         const char* why = socks5_reply_text(head[1]);
-        if (why) msg += std::string(" (") + why + ")";
-        log_line(msg);
+        if (why) msg += std::string(" ") + why;
+        msg += "）";
+        if (err) *err = msg;
         net_close(s);
         return kInvalidSock;
     }
@@ -434,7 +434,7 @@ static net_sock socks5_connect(const ProxyState& st)
         unsigned char len = 0;
         if (net_recv(s, &len, 1) != 1)
         {
-            log_line("[DEBUG] 读取域名长度失败");
+            if (err) *err = "读取域名长度失败";
             net_close(s);
             return kInvalidSock;
         }
@@ -442,7 +442,7 @@ static net_sock socks5_connect(const ProxyState& st)
     }
     else
     {
-        log_line("[DEBUG] CONNECT响应地址类型未知: " + hex2(atyp));
+        if (err) *err = "CONNECT 回复里的地址类型未知: " + hex2(atyp);
         net_close(s);
         return kInvalidSock;
     }
@@ -457,7 +457,7 @@ static net_sock socks5_connect(const ProxyState& st)
     }
     if (got != rest)
     {
-        log_line("[DEBUG] 读取CONNECT响应地址失败, 已读 " + std::to_string(got));
+        if (err) *err = "读取 CONNECT 回复的地址部分失败";
         net_close(s);
         return kInvalidSock;
     }
@@ -466,7 +466,7 @@ static net_sock socks5_connect(const ProxyState& st)
 }
 
 // ---------------------------------------------------------------------------
-//  relay_down —— 对应 FUN_140035330（代理侧 -> 本地客户端）
+//  转发
 // ---------------------------------------------------------------------------
 static void relay_down(const ProxyState* st, net_sock client, net_sock upstream)
 {
@@ -481,9 +481,6 @@ static void relay_down(const ProxyState* st, net_sock client, net_sock upstream)
     }
 }
 
-// ---------------------------------------------------------------------------
-//  relay_up —— 对应 FUN_1400e4300（本地客户端 -> 代理侧）
-// ---------------------------------------------------------------------------
 static void relay_up(const ProxyState* st, net_sock client, net_sock upstream)
 {
     std::vector<char> buf(4096);
@@ -497,16 +494,15 @@ static void relay_up(const ProxyState* st, net_sock client, net_sock upstream)
     }
 }
 
-// ---------------------------------------------------------------------------
-//  handle_client —— 每条连接一个上游 socket + 两个转发线程
-// ---------------------------------------------------------------------------
 static void handle_client(ProxyState* st, net_sock client)
 {
     st->connCount.fetch_add(1);
 
-    net_sock upstream = socks5_connect(*st);
+    std::string err;
+    net_sock upstream = socks5_connect(*st, &err);
     if (upstream == kInvalidSock)
     {
+        if (!err.empty()) log_line("[!] " + err);
         net_close(client);
         st->connCount.fetch_sub(1);
         return;
@@ -522,7 +518,7 @@ static void handle_client(ProxyState* st, net_sock client)
 }
 
 // ---------------------------------------------------------------------------
-//  listener_thread —— 对应 FUN_140034580
+//  监听
 // ---------------------------------------------------------------------------
 static void listener_thread(ProxyState* st)
 {
@@ -545,7 +541,8 @@ static void listener_thread(ProxyState* st)
 
     if (::bind(ls, (sockaddr*)&addr, (int)sizeof(addr)) != 0 || ::listen(ls, 10) != 0)
     {
-        log_line("[X] 监听端口 " + std::to_string(st->listenPort) + " 失败");
+        log_line("[X] 监听 0.0.0.0:" + std::to_string(st->listenPort) + " 失败");
+        log_line("    端口可能被占用（比如另一个代理已经在跑），先关掉占用的程序");
         net_close(ls);
         st->listenSock = kInvalidSock;
         return;
@@ -567,7 +564,7 @@ static void listener_thread(ProxyState* st)
 }
 
 // ---------------------------------------------------------------------------
-//  hosts —— 对应 FUN_14003b070 / FUN_140033d00
+//  hosts
 // ---------------------------------------------------------------------------
 #ifdef _WIN32
 static const char* kHostsPath = "C:\\Windows\\System32\\drivers\\etc\\hosts";
@@ -576,12 +573,14 @@ static const char* kHostsPath = "/etc/hosts";
 #endif
 static const char* kHostsMark = "# MC_PROXY";
 
-static void hosts_add_entry(const std::string& host)
+static void hosts_add_entry(const std::string& host, int listenPort)
 {
     FILE* f = std::fopen(kHostsPath, "a+");
     if (!f)
     {
-        log_line("[警告] 无权限写入 hosts，请手动把目标域名指向 127.0.0.1");
+        log_line("[警告] 写 hosts 失败（需要管理员/root 权限）");
+        log_line("        代理本身不受影响，游戏里直接连 127.0.0.1:" +
+                 std::to_string(listenPort) + " 即可");
         return;
     }
     std::fputs("\n127.0.0.1 ", f);
@@ -589,6 +588,7 @@ static void hosts_add_entry(const std::string& host)
     std::fputs(" # MC_PROXY", f);
     std::fflush(f);
     std::fclose(f);
+    log_line("[√] 已写入 hosts: 127.0.0.1 " + host);
 }
 
 static void hosts_remove_entries()
@@ -613,12 +613,12 @@ static void hosts_remove_entries()
 }
 
 // ---------------------------------------------------------------------------
-//  start_custom_proxy —— 对应 FUN_1400396b0
+//  启动 / 停止
 // ---------------------------------------------------------------------------
-static bool start_custom_proxy(ProxyState* st,
-                               const std::string& targetHost, int targetPort,
-                               const std::string& proxyIp, int proxyPort,
-                               const std::string& user, const std::string& pass)
+static bool start_proxy(ProxyState* st,
+                        const std::string& targetHost, int targetPort,
+                        const std::string& proxyIp, int proxyPort,
+                        const std::string& user, const std::string& pass)
 {
     if (st->running.load())
     {
@@ -633,37 +633,36 @@ static bool start_custom_proxy(ProxyState* st,
     st->proxyUser = user;
     st->proxyPass = pass;
 
-    log_line("正在测试自定义代理连接...");
+    log_line("");
+    log_line("目标服务器 : " + targetHost + ":" + std::to_string(targetPort));
+    log_line("代理服务器 : " + proxyIp + ":" + std::to_string(proxyPort) +
+             ((!user.empty() || !pass.empty()) ? " (用户名密码)" : " (无认证)"));
+    log_line("");
+    log_line("正在测试连接...");
 
-    net_sock t = socks5_connect(*st);
+    std::string err;
+    net_sock t = socks5_connect(*st, &err);
     if (t == kInvalidSock)
     {
-        log_line("[X] 代理连接测试失败，请检查代理信息是否正确");
+        log_line("[X] 连接测试失败");
+        if (!err.empty()) log_line("    原因: " + err);
         return false;
     }
     net_close(t);
     log_line("[√] 代理连接测试成功");
 
-    hosts_add_entry(st->targetHost);
+    hosts_add_entry(st->targetHost, st->listenPort);
 
     st->running.store(true);
     std::thread(listener_thread, st).detach();
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
 
-    log_line("[√] 自定义代理启动成功!");
-    log_line("[√] 本地监听: 0.0.0.0:" + std::to_string(st->listenPort));
-    log_line("[√] 目标服务器: " + st->targetHost + ":" + std::to_string(st->targetPort));
-    log_line("[√] 使用代理: " + st->proxyIp + ":" + std::to_string(st->proxyPort));
-    if (st->proxyUser.empty() && st->proxyPass.empty())
-        log_line("[√] 认证方式: 无（未填写账号密码）");
-    else
-        log_line("[√] 用户名: " + st->proxyUser);
+    log_line("");
+    log_line("[√] 代理已启动");
+    log_line("[√] 游戏里连接: 127.0.0.1:" + std::to_string(st->listenPort));
     return true;
 }
 
-// ---------------------------------------------------------------------------
-//  stop_proxy
-// ---------------------------------------------------------------------------
 static void stop_proxy(ProxyState* st)
 {
     if (!st->running.load())
@@ -697,7 +696,16 @@ static std::string ask(const char* prompt)
     return s;
 }
 
-int main()
+static int parse_or(const std::string& s, int fallback)
+{
+    if (s.empty()) return fallback;
+    char* end = nullptr;
+    long v = std::strtol(s.c_str(), &end, 10);
+    if (end == s.c_str()) return fallback;
+    return (int)v;
+}
+
+int main(int argc, char** argv)
 {
     console_init();
 
@@ -708,35 +716,57 @@ int main()
     }
 
     ProxyState st;
-    st.listenPort = 25565;              // 本地监听端口，固定 25565
+    st.listenPort = 25565;
 
     out_text("========================================\n");
     out_text("           代理核心演示程序\n");
     out_text("========================================\n\n");
 
-    std::string tHost = ask("目标服务器地址: ");
-    std::string s = ask("目标端口 (默认25565): ");
-    int tPort = s.empty() ? 25565 : std::atoi(s.c_str());
-    std::string pIp = ask("代理IP地址: ");
-    s = ask("代理端口 (默认1080): ");
-    int pPort = s.empty() ? 1080 : std::atoi(s.c_str());
-    std::string user = ask("代理用户名 (留空=不用账密): ");
-    std::string pass = ask("代理密码   (留空=不用账密): ");
+    std::string tHost, pIp, user, pass;
+    int tPort, pPort;
 
-    if (tHost.empty() || pIp.empty() || pPort <= 0)
+    if (argc >= 5)
     {
-        out_text("[X] 代理信息不完整，请重新输入\n");
+        tHost = argv[1];
+        tPort = parse_or(argv[2], 0);
+        pIp   = argv[3];
+        pPort = parse_or(argv[4], 0);
+        user  = (argc >= 6) ? argv[5] : "";
+        pass  = (argc >= 7) ? argv[6] : "";
+    }
+    else
+    {
+        out_text("目标服务器 = 你要连的 Minecraft 服务器\n");
+        out_text("代理服务器 = 你自己的 SOCKS5 代理（不是 MC 服务器）\n\n");
+
+        tHost = ask("目标服务器地址: ");
+        tPort = parse_or(ask("目标端口 (默认25565): "), 25565);
+        pIp   = ask("SOCKS5代理IP/域名: ");
+        pPort = parse_or(ask("SOCKS5代理端口 (默认1080): "), 1080);
+        user  = ask("代理用户名 (留空=不用账密): ");
+        pass  = ask("代理密码   (留空=不用账密): ");
+    }
+
+    if (tHost.empty() || pIp.empty() || tPort <= 0 || tPort > 65535 || pPort <= 0 || pPort > 65535)
+    {
+        log_line("[X] 参数不完整或端口不合法（端口范围 1-65535）");
+        pause_exit("");
         net_done();
         return 1;
     }
 
-    if (!start_custom_proxy(&st, tHost, tPort, pIp, pPort, user, pass))
+    if (!start_proxy(&st, tHost, tPort, pIp, pPort, user, pass))
     {
+        pause_exit("常见原因：\n"
+                   "  1. 「SOCKS5代理IP/端口」填成了 Minecraft 服务器地址，应该填你自己的 SOCKS5 代理\n"
+                   "  2. 代理服务器没开、端口不对、被防火墙拦了\n"
+                   "  3. 代理要求账号密码但没填");
         net_done();
         return 1;
     }
 
     out_text("\n按回车键停止代理并退出...\n");
+    std::fflush(stdout);
     std::string dummy;
     std::getline(std::cin, dummy);
     stop_proxy(&st);

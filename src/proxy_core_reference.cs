@@ -11,7 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-// 代理核心演示（C# 版，与 proxy_core.cpp 逻辑一一对应，用于验证协议实现）
+// 代理核心演示（C# 版，与 proxy_core.cpp 逻辑一一对应）
+//
+// 用法：
+//   代理核心演示.exe                                  交互输入
+//   代理核心演示.exe <目标> <目标端口> <代理IP> <代理端口> [用户] [密码]
 using System;
 using System.IO;
 using System.Net;
@@ -33,13 +37,24 @@ internal static class ProxyCore
         public int TargetPort;
         public int ListenPort = 25565;
         public int ConnCount;
+        public string LastError = "";
     }
 
     private static void Log(string s) { Console.WriteLine(s); }
 
+    private static void Pause(string hint)
+    {
+        Console.WriteLine();
+        if (hint != null && hint.Length > 0) Console.WriteLine(hint);
+        Console.WriteLine("按任意键退出...");
+        try { Console.ReadKey(true); } catch { }
+    }
+
     // ---------------- SOCKS5 握手 + CONNECT ----------------
     private static Socket ConnectSocks5(State st)
     {
+        st.LastError = "";
+
         Socket s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         s.ReceiveTimeout = 10000;
         s.SendTimeout = 10000;
@@ -49,17 +64,29 @@ internal static class ProxyCore
             IPAddress ip;
             if (!IPAddress.TryParse(st.ProxyIp, out ip))
             {
-                IPAddress[] list = Dns.GetHostAddresses(st.ProxyIp);
+                IPAddress[] list;
+                try { list = Dns.GetHostAddresses(st.ProxyIp); }
+                catch (Exception ex)
+                {
+                    st.LastError = "代理地址解析失败: " + st.ProxyIp + " (" + ex.Message + ")";
+                    s.Close();
+                    return null;
+                }
                 ip = null;
                 foreach (IPAddress a in list)
                     if (a.AddressFamily == AddressFamily.InterNetwork) { ip = a; break; }
-                if (ip == null) throw new Exception("resolve failed");
+                if (ip == null)
+                {
+                    st.LastError = "代理地址没有 IPv4 记录: " + st.ProxyIp;
+                    s.Close();
+                    return null;
+                }
             }
 
             try { s.Connect(new IPEndPoint(ip, st.ProxyPort)); }
             catch (Exception ex)
             {
-                Log("[DEBUG] 连接代理服务器 " + st.ProxyIp + ":" + st.ProxyPort + " 失败, 错误码: " + ex.Message);
+                st.LastError = "连不上代理服务器 " + st.ProxyIp + ":" + st.ProxyPort + " (" + ex.Message + ")";
                 s.Close();
                 return null;
             }
@@ -73,20 +100,31 @@ internal static class ProxyCore
 
             byte[] resp = new byte[2];
             int n = RecvExact(s, resp, 2);
-            if (n != 2 || resp[0] != 0x05)
+            if (n < 2)
             {
-                Log("[DEBUG] 握手响应无效, 收到 " + n + " 字节");
+                st.LastError = "代理服务器没有回应 SOCKS5 握手（收到 " + n + " 字节），"
+                             + "这个地址端口可能不是 SOCKS5 代理";
+                s.Close();
+                return null;
+            }
+            if (resp[0] != 0x05)
+            {
+                st.LastError = "对端不是 SOCKS5 代理（VER=0x" + resp[0].ToString("X2")
+                             + "），这个地址端口大概填错了";
                 s.Close();
                 return null;
             }
 
-            if (resp[1] == 0xFF) { Log("[DEBUG] 代理服务器拒绝所有请求的认证方法 (0xFF)"); s.Close(); return null; }
-            if (resp[1] == 0x02 && !useAuth) { Log("[DEBUG] 代理服务器要求用户名密码，但未填写账号密码"); s.Close(); return null; }
+            if (resp[1] == 0xFF) { st.LastError = "代理服务器拒绝所有认证方法 (0xFF)"; s.Close(); return null; }
+            if (resp[1] == 0x02 && !useAuth)
+            {
+                st.LastError = "代理服务器要求用户名密码，但没填账号密码";
+                s.Close(); return null;
+            }
             if (resp[1] != 0x00 && resp[1] != 0x02)
             {
-                Log("[DEBUG] 代理服务器选择了不支持的认证方法: 0x" + resp[1].ToString("X2"));
-                s.Close();
-                return null;
+                st.LastError = "代理服务器选中了不支持的认证方法: 0x" + resp[1].ToString("X2");
+                s.Close(); return null;
             }
 
             if (resp[1] == 0x02)
@@ -105,13 +143,20 @@ internal static class ProxyCore
                 n = RecvExact(s, ack, 2);
                 if (n != 2 || ack[1] != 0x00)
                 {
-                    Log("[DEBUG] 认证失败, 响应: " + n + " 字节");
+                    st.LastError = "代理用户名或密码错误";
                     s.Close();
                     return null;
                 }
             }
 
             byte[] host = Encoding.UTF8.GetBytes(st.TargetHost);
+            if (host.Length > 255)
+            {
+                st.LastError = "目标地址太长（超过 255 字节）";
+                s.Close();
+                return null;
+            }
+
             byte[] req = new byte[7 + host.Length];
             req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
             req[4] = (byte)host.Length;
@@ -124,13 +169,20 @@ internal static class ProxyCore
             n = RecvExact(s, head, 4);
             if (n != 4)
             {
-                Log("[DEBUG] 读取CONNECT响应头失败, 已读 " + n);
+                st.LastError = "读取 CONNECT 回复失败（收到 " + n + " / 4 字节）";
                 s.Close();
                 return null;
             }
             if (head[1] != 0x00)
             {
-                Log("[DEBUG] CONNECT请求被拒绝, 错误码: 0x" + head[1].ToString("X2"));
+                string[] why = new string[]
+                {
+                    "成功", "一般性失败", "规则不允许", "网络不可达", "主机不可达",
+                    "连接被拒绝", "TTL过期", "不支持的命令", "不支持的地址类型"
+                };
+                string desc = head[1] < why.Length ? why[head[1]] : "未知";
+                st.LastError = "代理拒绝了到 " + st.TargetHost + ":" + st.TargetPort
+                             + " 的 CONNECT（错误码 0x" + head[1].ToString("X2") + " " + desc + "）";
                 s.Close();
                 return null;
             }
@@ -141,19 +193,29 @@ internal static class ProxyCore
             else if (head[3] == 0x03)
             {
                 byte[] l = new byte[1];
-                if (RecvExact(s, l, 1) != 1) { Log("[DEBUG] 读取域名长度失败"); s.Close(); return null; }
+                if (RecvExact(s, l, 1) != 1) { st.LastError = "读取域名长度失败"; s.Close(); return null; }
                 rest = l[0] + 2;
             }
-            else { Log("[DEBUG] CONNECT响应地址类型未知: 0x" + head[3].ToString("X2")); s.Close(); return null; }
+            else
+            {
+                st.LastError = "CONNECT 回复里的地址类型未知: 0x" + head[3].ToString("X2");
+                s.Close();
+                return null;
+            }
 
             byte[] tail = new byte[rest];
-            if (RecvExact(s, tail, rest) != rest) { Log("[DEBUG] 读取CONNECT响应地址失败"); s.Close(); return null; }
+            if (RecvExact(s, tail, rest) != rest)
+            {
+                st.LastError = "读取 CONNECT 回复的地址部分失败";
+                s.Close();
+                return null;
+            }
 
             return s;
         }
         catch (Exception ex)
         {
-            Log("[DEBUG] 异常: " + ex.Message);
+            st.LastError = "代理连接异常: " + ex.Message;
             try { s.Close(); } catch { }
             return null;
         }
@@ -164,7 +226,9 @@ internal static class ProxyCore
         int got = 0;
         while (got < len)
         {
-            int r = s.Receive(buf, got, len - got, SocketFlags.None);
+            int r;
+            try { r = s.Receive(buf, got, len - got, SocketFlags.None); }
+            catch (SocketException) { break; }
             if (r < 1) break;
             got += r;
         }
@@ -179,6 +243,7 @@ internal static class ProxyCore
         Socket up = ConnectSocks5(st);
         if (up == null)
         {
+            if (st.LastError.Length > 0) Log("[!] " + st.LastError);
             try { client.Close(); } catch { }
             Interlocked.Decrement(ref st.ConnCount);
             return;
@@ -188,7 +253,7 @@ internal static class ProxyCore
         t.IsBackground = true;
         t.Start();
 
-        Relay(st, up, client);   // 下游：代理 -> 本地
+        Relay(st, up, client);
         try { t.Join(2000); } catch { }
 
         try { up.Close(); } catch { }
@@ -217,8 +282,17 @@ internal static class ProxyCore
         Socket ls = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         st.Listen = ls;
         ls.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        try { ls.Bind(new IPEndPoint(IPAddress.Any, st.ListenPort)); ls.Listen(10); }
-        catch (Exception ex) { Log("[X] 监听失败: " + ex.Message); return; }
+        try
+        {
+            ls.Bind(new IPEndPoint(IPAddress.Any, st.ListenPort));
+            ls.Listen(10);
+        }
+        catch (Exception ex)
+        {
+            Log("[X] 监听 0.0.0.0:" + st.ListenPort + " 失败: " + ex.Message);
+            Log("    端口可能被占用（比如另一个代理已经在跑），换个端口或先关掉占用的程序");
+            return;
+        }
 
         while (st.Running)
         {
@@ -240,10 +314,18 @@ internal static class ProxyCore
     // ---------------- hosts ----------------
     private static readonly string HostsPath = @"C:\Windows\System32\drivers\etc\hosts";
 
-    private static void HostsAdd(string host)
+    private static void HostsAdd(string host, int listenPort)
     {
-        try { File.AppendAllText(HostsPath, "\n127.0.0.1 " + host + " # MC_PROXY", Encoding.ASCII); }
-        catch (Exception ex) { Log("[警告] 写 hosts 失败: " + ex.Message); }
+        try
+        {
+            File.AppendAllText(HostsPath, "\n127.0.0.1 " + host + " # MC_PROXY", Encoding.ASCII);
+            Log("[√] 已写入 hosts: 127.0.0.1 " + host);
+        }
+        catch (Exception ex)
+        {
+            Log("[警告] 写 hosts 失败（需要管理员权限）: " + ex.Message);
+            Log("        代理本身不受影响，游戏里直接连 127.0.0.1:" + listenPort + " 即可");
+        }
     }
 
     private static void HostsRemove()
@@ -259,7 +341,7 @@ internal static class ProxyCore
             }
             File.WriteAllText(HostsPath, sb.ToString(), Encoding.ASCII);
         }
-        catch (Exception ex) { Log("[警告] 清理 hosts 失败: " + ex.Message); }
+        catch { }
     }
 
     // ---------------- 启动 / 停止 ----------------
@@ -271,25 +353,55 @@ internal static class ProxyCore
         st.ProxyIp = pIp; st.ProxyPort = pPort;
         st.ProxyUser = user; st.ProxyPass = pass;
 
-        Log("正在测试自定义代理连接...");
+        Log("");
+        Log("目标服务器 : " + tHost + ":" + tPort);
+        Log("代理服务器 : " + pIp + ":" + pPort
+            + ((user.Length > 0 || pass.Length > 0) ? " (用户名密码)" : " (无认证)"));
+        Log("");
+        Log("正在测试连接...");
+
         Socket t = ConnectSocks5(st);
-        if (t == null) { Log("[X] 代理连接测试失败，请检查代理信息是否正确"); return false; }
+        if (t == null)
+        {
+            Log("[X] 连接测试失败");
+            if (st.LastError.Length > 0) Log("    原因: " + st.LastError);
+            return false;
+        }
         t.Close();
         Log("[√] 代理连接测试成功");
 
-        HostsAdd(st.TargetHost);
+        HostsAdd(st.TargetHost, st.ListenPort);
 
         st.Running = true;
         Thread th = new Thread(delegate () { Listener(st); });
         th.IsBackground = true;
         th.Start();
-        Thread.Sleep(500);
+        Thread.Sleep(600);
 
-        Log("[√] 自定义代理启动成功!");
-        Log("[√] MC中连接地址: " + st.TargetHost);
-        Log("[√] 使用代理: " + st.ProxyIp + ":" + st.ProxyPort);
-        Log("[√] 用户名: " + st.ProxyUser);
+        Log("");
+        Log("[√] 代理已启动");
+        Log("[√] 游戏里连接: 127.0.0.1:" + st.ListenPort);
+
+        ProbeLocal(st.ListenPort);
         return true;
+    }
+
+    // 探测本地监听是否真的起来了
+    private static void ProbeLocal(int port)
+    {
+        try
+        {
+            using (Socket probe = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
+            {
+                probe.ReceiveTimeout = 3000;
+                probe.Connect(new IPEndPoint(IPAddress.Loopback, port));
+                Log("[√] 本地端口 " + port + " 已可连接");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("[!] 本地 " + port + " 连不上: " + ex.Message);
+        }
     }
 
     private static void Stop(State st)
@@ -312,9 +424,31 @@ internal static class ProxyCore
         return s == null ? "" : s.Trim();
     }
 
+    private static int ParseOr(string s, int fallback)
+    {
+        int v;
+        return int.TryParse(s, out v) ? v : fallback;
+    }
+
     private static int Main(string[] args)
     {
-        Console.OutputEncoding = Encoding.UTF8;
+        try
+        {
+            try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+            return Run(args);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine();
+            Console.WriteLine("[X] 程序异常退出: " + ex.GetType().Name + ": " + ex.Message);
+            Console.WriteLine(ex.StackTrace);
+            Pause("");
+            return 99;
+        }
+    }
+
+    private static int Run(string[] args)
+    {
         State st = new State { ListenPort = 25565 };
 
         Console.WriteLine("========================================");
@@ -322,22 +456,47 @@ internal static class ProxyCore
         Console.WriteLine("========================================");
         Console.WriteLine();
 
-        string tHost = Ask("目标服务器地址: ");
-        string s = Ask("目标端口 (默认25565): ");
-        int tPort = s.Length > 0 ? int.Parse(s) : 25565;
-        string pIp = Ask("自己的代理IP地址: ");
-        s = Ask("自己的代理端口: ");
-        int pPort = s.Length > 0 ? int.Parse(s) : 1080;
-        string user = Ask("代理用户名 (留空=不用账密): ");
-        string pass = Ask("代理密码   (留空=不用账密): ");
+        string tHost, pIp, user, pass;
+        int tPort, pPort;
 
-        if (tHost.Length == 0 || pIp.Length == 0 || pPort <= 0)
+        if (args.Length >= 4)
         {
-            Console.WriteLine("[X] 代理信息不完整，请重新输入");
+            tHost = args[0];
+            tPort = ParseOr(args[1], 0);
+            pIp   = args[2];
+            pPort = ParseOr(args[3], 0);
+            user  = args.Length >= 5 ? args[4] : "";
+            pass  = args.Length >= 6 ? args[5] : "";
+        }
+        else
+        {
+            Console.WriteLine("目标服务器 = 你要连的 Minecraft 服务器");
+            Console.WriteLine("代理服务器 = 你自己的 SOCKS5 代理（不是 MC 服务器）");
+            Console.WriteLine();
+
+            tHost = Ask("目标服务器地址: ");
+            tPort = ParseOr(Ask("目标端口 (默认25565): "), 25565);
+            pIp   = Ask("SOCKS5代理IP/域名: ");
+            pPort = ParseOr(Ask("SOCKS5代理端口 (默认1080): "), 1080);
+            user  = Ask("代理用户名 (留空=不用账密): ");
+            pass  = Ask("代理密码   (留空=不用账密): ");
+        }
+
+        if (tHost.Length == 0 || pIp.Length == 0 || tPort <= 0 || tPort > 65535 || pPort <= 0 || pPort > 65535)
+        {
+            Log("[X] 参数不完整或端口不合法（端口范围 1-65535）");
+            Pause("");
             return 1;
         }
 
-        if (!Start(st, tHost, tPort, pIp, pPort, user, pass)) return 1;
+        if (!Start(st, tHost, tPort, pIp, pPort, user, pass))
+        {
+            Pause("常见原因：\n"
+                + "  1. 「SOCKS5代理IP/端口」填成了 Minecraft 服务器地址，应该填你自己的 SOCKS5 代理\n"
+                + "  2. 代理服务器没开、端口不对、被防火墙拦了\n"
+                + "  3. 代理要求账号密码但没填");
+            return 1;
+        }
 
         Console.WriteLine();
         Console.WriteLine("按回车键停止代理并退出...");
