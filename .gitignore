@@ -1,0 +1,26 @@
+# 构建产物
+build/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.a
+*.so
+
+# zig
+.zig-cache/
+zig-cache/
+zig-out/
+
+# 编辑器 / IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+
+# 系统
+Thumbs.db
+.DS_Store
