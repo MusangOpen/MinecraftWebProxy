@@ -17,9 +17,11 @@
 //   代理核心演示.exe                                  交互输入
 //   代理核心演示.exe <目标> <目标端口> <代理IP> <代理端口> [用户] [密码]
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -439,6 +441,76 @@ internal static class ProxyCore
         return IPAddress.TryParse(s, out ip);
     }
 
+    // ---------------- 枚举本机网卡 ----------------
+    private sealed class NicOption
+    {
+        public string Name = "";
+        public string Ip = "";
+        public string Gateway = "";
+        public string Iface = "";
+        public bool HasGateway;
+        public bool IsVirtual;
+    }
+
+    private static bool LooksVirtual(string text)
+    {
+        string s = text.ToLowerInvariant();
+        string[] keys = new string[]
+        {
+            "vmware", "virtualbox", "virtual", "hyper-v", "vethernet",
+            "tap-", "tun", "wireguard", "openvpn", "radmin", "zerotier",
+            "tailscale", "wsl", "docker", "mihomo", "clash", "loopback"
+        };
+        foreach (string k in keys)
+            if (s.Contains(k)) return true;
+        return false;
+    }
+
+    private static List<NicOption> ListNics()
+    {
+        List<NicOption> list = new List<NicOption>();
+        NetworkInterface[] all = NetworkInterface.GetAllNetworkInterfaces();
+
+        foreach (NetworkInterface ni in all)
+        {
+            if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+            if (ni.OperationalStatus != OperationalStatus.Up) continue;
+
+            IPInterfaceProperties props;
+            try { props = ni.GetIPProperties(); }
+            catch { continue; }
+
+            string ip = "";
+            foreach (UnicastIPAddressInformation ua in props.UnicastAddresses)
+            {
+                if (ua.Address.AddressFamily == AddressFamily.InterNetwork) { ip = ua.Address.ToString(); break; }
+            }
+            if (ip.Length == 0) continue;
+
+            string gw = "";
+            foreach (GatewayIPAddressInformation g in props.GatewayAddresses)
+            {
+                if (g.Address.AddressFamily == AddressFamily.InterNetwork) { gw = g.Address.ToString(); break; }
+            }
+
+            NicOption o = new NicOption();
+            o.Name = ni.Name;
+            o.Ip = ip;
+            o.Gateway = gw;
+            o.HasGateway = gw.Length > 0;
+            o.IsVirtual = LooksVirtual(ni.Name + " " + ni.Description);
+            try
+            {
+                IPv4InterfaceProperties v4 = props.GetIPv4Properties();
+                o.Iface = v4 != null ? v4.Index.ToString() : "";
+            }
+            catch { o.Iface = ""; }
+
+            list.Add(o);
+        }
+        return list;
+    }
+
     // ---------------- 网卡模式：不代理，只让目标 IP 走指定网卡 ----------------
     private static int RunNicMode(string tHost, int tPort)
     {
@@ -460,10 +532,49 @@ internal static class ProxyCore
         State st = new State();
         st.RouteEnabled = true;
         st.RouteTarget  = ip;
-        st.RouteMask    = Ask("  子网掩码 (默认 255.255.255.255): ");
-        if (st.RouteMask.Length == 0) st.RouteMask = "255.255.255.255";
-        st.RouteGateway = Ask("  网关地址 (如 192.168.1.1): ");
-        st.RouteIface   = Ask("  网卡索引 (如 12，用 route print 查看，可留空): ");
+        // 掩码固定单个 IP：只让这一个服务器走指定网卡
+        st.RouteMask    = "255.255.255.255";
+
+        List<NicOption> nics = ListNics();
+        if (nics.Count == 0)
+        {
+            Log("[X] 没有找到可用的网卡");
+            Pause("");
+            return 1;
+        }
+
+        Log("");
+        Log("=== 可用网卡 ===");
+        for (int i = 0; i < nics.Count; i++)
+        {
+            NicOption n = nics[i];
+            string line = "  " + (i + 1) + ") " + n.Name + "   (" + n.Ip + ")";
+            line += n.HasGateway ? "   网关 " + n.Gateway : "   无默认网关";
+            if (n.IsVirtual) line += "   [虚拟]";
+            Log(line);
+        }
+        Log("  提示: 一般选名称像「以太网」「WLAN」的物理网卡，[虚拟] 的多为 VPN/TUN/虚拟机");
+
+        int sel = ParseOr(Ask("\n请选择走哪块网卡 (序号): "), 0);
+        if (sel < 1 || sel > nics.Count)
+        {
+            Log("[X] 序号无效");
+            Pause("");
+            return 1;
+        }
+
+        NicOption nic = nics[sel - 1];
+        st.RouteIface = nic.Iface;
+
+        if (nic.HasGateway)
+        {
+            st.RouteGateway = nic.Gateway;
+            Log("  使用网关: " + st.RouteGateway);
+        }
+        else
+        {
+            st.RouteGateway = Ask("  该网卡没有默认网关，请手动输入网关: ");
+        }
 
         if (st.RouteGateway.Length == 0)
         {

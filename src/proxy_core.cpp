@@ -32,6 +32,7 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
+  #include <iphlpapi.h>
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -853,8 +854,186 @@ static int parse_or(const std::string& s, int fallback)
 }
 
 // ---------------------------------------------------------------------------
-//  网卡模式：不给流量做代理，只让目标 IP 走指定网卡（纯路由）
+//  枚举本机网卡：让用户直接选，不用手输索引和网关
 // ---------------------------------------------------------------------------
+struct NicOption
+{
+    std::string name;      // 网卡名称
+    std::string ip;        // IPv4 地址
+    std::string gateway;   // 默认网关
+    std::string iface;     // Windows: 数字索引；Linux: 网卡名
+    bool        hasGateway;
+    bool        isVirtual; // 虚拟网卡（VMware / TUN / VPN 之类）
+};
+
+// 判断是不是虚拟网卡，用于在列表里标注，避免选错
+static bool looks_virtual_nic(const std::string& text)
+{
+    std::string s;
+    s.reserve(text.size());
+    for (size_t i = 0; i < text.size(); ++i)
+        s.push_back((char)std::tolower((unsigned char)text[i]));
+
+    static const char* keys[] = {
+        "vmware", "virtualbox", "virtual", "hyper-v", "vethernet",
+        "tap-", "tun", "wireguard", "openvpn", "radmin", "zerotier",
+        "tailscale", "wsl", "docker", "mihomo", "clash", "loopback"
+    };
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); ++k)
+        if (s.find(keys[k]) != std::string::npos) return true;
+    return false;
+}
+
+#ifdef _WIN32
+
+static std::string wide_to_utf8(const wchar_t* w)
+{
+    if (!w) return "";
+    int n = ::WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return "";
+    std::vector<char> b((size_t)n);
+    ::WideCharToMultiByte(CP_UTF8, 0, w, -1, b.data(), n, nullptr, nullptr);
+    return std::string(b.data());
+}
+
+static std::vector<NicOption> list_nics()
+{
+    std::vector<NicOption> out;
+    ULONG size = 16 * 1024;
+    PIP_ADAPTER_ADDRESSES addrs = nullptr;
+
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        addrs = (PIP_ADAPTER_ADDRESSES)std::malloc(size);
+        if (!addrs) return out;
+        ULONG rc = ::GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS, nullptr, addrs, &size);
+        if (rc == NO_ERROR) break;
+        std::free(addrs);
+        addrs = nullptr;
+        if (rc != ERROR_BUFFER_OVERFLOW) return out;
+    }
+    if (!addrs) return out;
+
+    for (PIP_ADAPTER_ADDRESSES a = addrs; a; a = a->Next)
+    {
+        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        if (a->OperStatus != IfOperStatusUp) continue;
+
+        NicOption o;
+        o.name = wide_to_utf8(a->FriendlyName);
+        o.hasGateway = false;
+        o.isVirtual = looks_virtual_nic(o.name + " " + wide_to_utf8(a->Description));
+        char idx[32];
+        std::snprintf(idx, sizeof(idx), "%lu", (unsigned long)a->IfIndex);
+        o.iface = idx;
+
+        for (PIP_ADAPTER_UNICAST_ADDRESS ua = a->FirstUnicastAddress; ua; ua = ua->Next)
+        {
+            if (!ua->Address.lpSockaddr || ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+            sockaddr_in* sin = (sockaddr_in*)ua->Address.lpSockaddr;
+            char buf[64] = { 0 };
+            ::inet_ntop(AF_INET, &sin->sin_addr, buf, (socklen_t)sizeof(buf));
+            o.ip = buf;
+            break;
+        }
+
+        for (PIP_ADAPTER_GATEWAY_ADDRESS ga = a->FirstGatewayAddress; ga; ga = ga->Next)
+        {
+            if (!ga->Address.lpSockaddr || ga->Address.lpSockaddr->sa_family != AF_INET) continue;
+            sockaddr_in* sin = (sockaddr_in*)ga->Address.lpSockaddr;
+            char buf[64] = { 0 };
+            ::inet_ntop(AF_INET, &sin->sin_addr, buf, (socklen_t)sizeof(buf));
+            o.gateway = buf;
+            o.hasGateway = true;
+            break;
+        }
+
+        if (o.ip.empty()) continue;
+        out.push_back(o);
+    }
+
+    std::free(addrs);
+    return out;
+}
+
+#else
+
+static std::vector<std::string> split_ws(const std::string& s)
+{
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < s.size())
+    {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+        size_t j = i;
+        while (j < s.size() && !(s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n')) ++j;
+        if (j > i) out.push_back(s.substr(i, j - i));
+        i = j;
+    }
+    return out;
+}
+
+static std::string sh_capture(const char* cmd)
+{
+    std::string out;
+    FILE* p = ::popen(cmd, "r");
+    if (!p) return out;
+    char buf[512];
+    while (std::fgets(buf, sizeof(buf), p)) out += buf;
+    ::pclose(p);
+    return out;
+}
+
+static std::vector<NicOption> list_nics()
+{
+    std::vector<NicOption> out;
+
+    // 默认网关：ip -4 route show default  ->  default via 192.168.1.1 dev eth0
+    std::string gw;
+    {
+        std::vector<std::string> t = split_ws(sh_capture("ip -4 route show default 2>/dev/null"));
+        for (size_t i = 0; i + 1 < t.size(); ++i)
+            if (t[i] == "via") { gw = t[i + 1]; break; }
+    }
+
+    // 网卡 IPv4：ip -o -4 addr show -> 2: eth0 inet 192.168.1.5/24 ...
+    std::string addrs = sh_capture("ip -o -4 addr show 2>/dev/null");
+    size_t pos = 0;
+    while (pos < addrs.size())
+    {
+        size_t e = addrs.find('\n', pos);
+        if (e == std::string::npos) e = addrs.size();
+        std::string line = addrs.substr(pos, e - pos);
+        pos = e + 1;
+
+        std::vector<std::string> t = split_ws(line);
+        if (t.size() < 4) continue;
+
+        std::string name = t[1];
+        if (name == "lo") continue;
+
+        std::string inet;
+        for (size_t i = 0; i + 1 < t.size(); ++i)
+            if (t[i] == "inet") { inet = t[i + 1]; break; }
+        if (inet.empty()) continue;
+        size_t slash = inet.find('/');
+        if (slash != std::string::npos) inet = inet.substr(0, slash);
+
+        NicOption o;
+        o.name = name;
+        o.ip = inet;
+        o.iface = name;
+        o.hasGateway = false;
+        o.isVirtual = looks_virtual_nic(name);
+        if (!gw.empty()) { o.gateway = gw; o.hasGateway = true; }
+        out.push_back(o);
+    }
+    return out;
+}
+
+#endif
+
+
 static int run_nic_mode(const std::string& tHost, int tPort)
 {
     std::string ip = tHost;
@@ -887,14 +1066,51 @@ static int run_nic_mode(const std::string& tHost, int tPort)
     RouteSpec r;
     r.enabled = true;
     r.target  = ip;
-    r.mask    = ask("  子网掩码 (默认 255.255.255.255): ");
-    if (r.mask.empty()) r.mask = "255.255.255.255";
-    r.gateway = ask("  网关地址 (如 192.168.1.1): ");
-#ifdef _WIN32
-    r.iface   = ask("  网卡索引 (如 12，用 route print 查看，可留空): ");
-#else
-    r.iface   = ask("  网卡名 (如 eth1，可留空): ");
-#endif
+    // 掩码固定单个 IP：只让这一个服务器走指定网卡，不需要用户理解掩码
+    r.mask    = "255.255.255.255";
+
+    // 列出网卡让用户直接选
+    std::vector<NicOption> nics = list_nics();
+    if (nics.empty())
+    {
+        log_line("[X] 没有找到可用的网卡");
+        pause_exit("");
+        return 1;
+    }
+
+    log_line("");
+    log_line("=== 可用网卡 ===");
+    for (size_t i = 0; i < nics.size(); ++i)
+    {
+        std::string line = "  " + std::to_string(i + 1) + ") " + nics[i].name +
+                           "   (" + nics[i].ip + ")";
+        if (nics[i].hasGateway) line += "   网关 " + nics[i].gateway;
+        else                    line += "   无默认网关";
+        if (nics[i].isVirtual)  line += "   [虚拟]";
+        log_line(line);
+    }
+    log_line("  提示: 一般选名称像「以太网」「WLAN」的物理网卡，[虚拟] 的多为 VPN/TUN/虚拟机");
+
+    int sel = parse_or(ask("\n请选择走哪块网卡 (序号): "), 0);
+    if (sel < 1 || sel > (int)nics.size())
+    {
+        log_line("[X] 序号无效");
+        pause_exit("");
+        return 1;
+    }
+
+    const NicOption& nic = nics[sel - 1];
+    r.iface = nic.iface;
+
+    if (nic.hasGateway)
+    {
+        r.gateway = nic.gateway;
+        log_line("  使用网关: " + r.gateway);
+    }
+    else
+    {
+        r.gateway = ask("  该网卡没有默认网关，请手动输入网关: ");
+    }
 
     if (r.gateway.empty())
     {
