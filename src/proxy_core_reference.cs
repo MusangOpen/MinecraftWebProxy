@@ -50,6 +50,8 @@ internal static class ProxyCore
         public string RouteIface = "";
 
         public int FailStage;   // 0=无 1=路由失败 2=连接失败
+
+        public bool ModifyHosts;   // 默认不碰系统 hosts
     }
 
     private static void Log(string s) { Console.WriteLine(s); }
@@ -328,15 +330,22 @@ internal static class ProxyCore
 
     private static void HostsAdd(string host, int listenPort)
     {
+        string want = "127.0.0.1 " + host + " # MC_PROXY";
         try
         {
-            File.AppendAllText(HostsPath, "\n127.0.0.1 " + host + " # MC_PROXY", Encoding.ASCII);
-            Log("[√] 已写入 hosts: 127.0.0.1 " + host);
+            // 已有同样条目就不重复添加
+            if (File.Exists(HostsPath))
+            {
+                foreach (string l in File.ReadAllLines(HostsPath))
+                    if (l.Contains(want)) return;
+            }
+            File.AppendAllText(HostsPath, "\n" + want, Encoding.ASCII);
+            Log("[√] 已写入 hosts: " + want);
         }
         catch (Exception ex)
         {
             Log("[警告] 写 hosts 失败（需要管理员权限）: " + ex.Message);
-            Log("        代理本身不受影响，游戏里直接连 127.0.0.1:" + listenPort + " 即可");
+            Log("        游戏里直接连 127.0.0.1:" + listenPort + " 即可");
         }
     }
 
@@ -344,7 +353,16 @@ internal static class ProxyCore
     {
         try
         {
+            if (!File.Exists(HostsPath)) return;
+
             string[] lines = File.ReadAllLines(HostsPath);
+
+            // 没有自己的条目就绝对不要重写文件
+            bool found = false;
+            foreach (string l in lines)
+                if (l.Contains("# MC_PROXY")) { found = true; break; }
+            if (!found) return;
+
             StringBuilder sb = new StringBuilder();
             foreach (string l in lines)
             {
@@ -352,6 +370,7 @@ internal static class ProxyCore
                 sb.AppendLine(l);
             }
             File.WriteAllText(HostsPath, sb.ToString(), Encoding.ASCII);
+            Log("[√] 已清理 hosts 中的 # MC_PROXY 行");
         }
         catch { }
     }
@@ -646,7 +665,14 @@ internal static class ProxyCore
         t.Close();
         Log("[√] 代理连接测试成功");
 
-        HostsAdd(st.TargetHost, st.ListenPort);
+        if (st.ModifyHosts)
+        {
+            HostsAdd(st.TargetHost, st.ListenPort);
+        }
+        else
+        {
+            Log("[提示] 未修改 hosts，游戏里直接连 127.0.0.1:" + st.ListenPort);
+        }
 
         st.Running = true;
         Thread th = new Thread(delegate () { Listener(st); });
@@ -688,7 +714,7 @@ internal static class ProxyCore
         Socket ls = st.Listen;
         if (ls != null) { try { ls.Close(); } catch { } }
         st.Listen = null;
-        HostsRemove();
+        if (st.ModifyHosts) HostsRemove();
         RouteDel(st);
         Thread.Sleep(300);
         Log("[√] 代理已停止");
@@ -788,6 +814,11 @@ internal static class ProxyCore
             pPort = ParseOr(Ask("SOCKS5代理端口 (默认1080): "), 1080);
             user  = Ask("代理用户名 (留空=不用账密): ");
             pass  = Ask("代理密码   (留空=不用账密): ");
+
+            // hosts 默认不改：会影响本机所有访问该域名的程序（Gradle / 启动器 / IDE 等）
+            Console.WriteLine();
+            string yh = Ask("是否修改系统 hosts 把 " + tHost + " 指向本机? (y/N，一般不需要): ");
+            st.ModifyHosts = (yh.Length > 0 && (yh[0] == 'y' || yh[0] == 'Y'));
 
             // ---- 可选：让 SOCKS5 代理服务器的流量走指定网卡 ----
             Console.WriteLine();

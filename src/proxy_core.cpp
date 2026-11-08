@@ -235,6 +235,7 @@ struct ProxyState
     std::atomic<int>  connCount{ 0 };
     RouteSpec         route;
     int               failStage{ 0 };   // 0=无 1=路由失败 2=连接失败
+    bool              modifyHosts{ false };  // 默认不碰系统 hosts
 };
 
 static const char* socks5_reply_text(unsigned char rep)
@@ -592,12 +593,30 @@ static const char* kHostsMark = "# MC_PROXY";
 
 static void hosts_add_entry(const std::string& host, int listenPort)
 {
+    // 已经有同样的条目就不重复添加
+    std::string want = "127.0.0.1 " + host + " # MC_PROXY";
+    {
+        FILE* r = std::fopen(kHostsPath, "r");
+        if (r)
+        {
+            char line[1024];
+            while (std::fgets(line, sizeof(line), r))
+            {
+                if (std::string(line).find(want) != std::string::npos)
+                {
+                    std::fclose(r);
+                    return;
+                }
+            }
+            std::fclose(r);
+        }
+    }
+
     FILE* f = std::fopen(kHostsPath, "a+");
     if (!f)
     {
         log_line("[警告] 写 hosts 失败（需要管理员/root 权限）");
-        log_line("        代理本身不受影响，游戏里直接连 127.0.0.1:" +
-                 std::to_string(listenPort) + " 即可");
+        log_line("        游戏里直接连 127.0.0.1:" + std::to_string(listenPort) + " 即可");
         return;
     }
     std::fputs("\n127.0.0.1 ", f);
@@ -605,11 +624,25 @@ static void hosts_add_entry(const std::string& host, int listenPort)
     std::fputs(" # MC_PROXY", f);
     std::fflush(f);
     std::fclose(f);
-    log_line("[√] 已写入 hosts: 127.0.0.1 " + host);
+    log_line("[√] 已写入 hosts: " + want);
 }
 
 static void hosts_remove_entries()
 {
+    // 先确认文件里确实有自己的条目，没有就绝对不要碰文件
+    bool found = false;
+    {
+        FILE* r = std::fopen(kHostsPath, "r");
+        if (!r) return;
+        char line[1024];
+        while (std::fgets(line, sizeof(line), r))
+        {
+            if (std::string(line).find(kHostsMark) != std::string::npos) { found = true; break; }
+        }
+        std::fclose(r);
+    }
+    if (!found) return;
+
     FILE* f = std::fopen(kHostsPath, "r");
     if (!f) return;
 
@@ -627,6 +660,7 @@ static void hosts_remove_entries()
     if (!w) return;
     for (size_t i = 0; i < keep.size(); ++i) std::fputs(keep[i].c_str(), w);
     std::fclose(w);
+    log_line("[√] 已清理 hosts 中的 # MC_PROXY 行");
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +832,15 @@ static bool start_proxy(ProxyState* st,
     net_close(t);
     log_line("[√] 代理连接测试成功");
 
-    hosts_add_entry(st->targetHost, st->listenPort);
+    // 默认不修改 hosts；只有在用户明确选择时才写
+    if (st->modifyHosts)
+    {
+        hosts_add_entry(st->targetHost, st->listenPort);
+    }
+    else
+    {
+        log_line("[提示] 未修改 hosts，游戏里直接连 127.0.0.1:" + std::to_string(st->listenPort));
+    }
 
     st->running.store(true);
     std::thread(listener_thread, st).detach();
@@ -824,7 +866,7 @@ static void stop_proxy(ProxyState* st)
     if (ls != kInvalidSock) net_close(ls);
     st->listenSock = kInvalidSock;
 
-    hosts_remove_entries();
+    if (st->modifyHosts) hosts_remove_entries();
     route_del(st->route);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     log_line("[√] 代理已停止");
@@ -1218,6 +1260,17 @@ int main(int argc, char** argv)
         pPort = parse_or(ask("SOCKS5代理端口 (默认1080): "), 1080);
         user  = ask("代理用户名 (留空=不用账密): ");
         pass  = ask("代理密码   (留空=不用账密): ");
+
+        // hosts 默认不改：改了会影响本机所有访问该域名的程序（Gradle/启动器/IDE 等）
+        out_text("\n是否修改系统 hosts 把 " );
+        out_text(tHost.c_str());
+        out_text(" 指向本机? (y/N，一般不需要): ");
+        std::fflush(stdout);
+        std::string yh;
+        std::getline(std::cin, yh);
+        while (!yh.empty() && (yh[yh.size() - 1] == '\r' || yh[yh.size() - 1] == '\n'))
+            yh.erase(yh.size() - 1);
+        st.modifyHosts = (!yh.empty() && (yh[0] == 'y' || yh[0] == 'Y'));
 
         // ---- 可选：给 SOCKS5 代理服务器的 IP 单独加路由（走专线时有用）----
         out_text("\n是否让「SOCKS5代理服务器」的流量走指定网卡? (y/N): ");
