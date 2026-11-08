@@ -722,6 +722,26 @@ static void route_del(const RouteSpec& r)
 #endif
 }
 
+// 把域名解析成 IPv4（route 只能针对 IP）
+static std::string resolve_ipv4(const std::string& host)
+{
+    addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo* res = nullptr;
+    if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr)
+        return std::string();
+
+    char buf[64];
+    std::memset(buf, 0, sizeof(buf));
+    sockaddr_in* sa = (sockaddr_in*)res->ai_addr;
+    ::inet_ntop(AF_INET, &sa->sin_addr, buf, (socklen_t)sizeof(buf));
+    ::freeaddrinfo(res);
+    return std::string(buf);
+}
+
 // ---------------------------------------------------------------------------
 //  启动 / 停止
 // ---------------------------------------------------------------------------
@@ -832,6 +852,80 @@ static int parse_or(const std::string& s, int fallback)
     return (int)v;
 }
 
+// ---------------------------------------------------------------------------
+//  网卡模式：不给流量做代理，只让目标 IP 走指定网卡（纯路由）
+// ---------------------------------------------------------------------------
+static int run_nic_mode(const std::string& tHost, int tPort)
+{
+    std::string ip = tHost;
+    // 目标是域名就先解析成 IP，route 只能针对 IP
+    bool isIp = true;
+    for (size_t i = 0; i < tHost.size(); ++i)
+    {
+        char ch = tHost[i];
+        if (!((ch >= '0' && ch <= '9') || ch == '.'))
+        {
+            isIp = false;
+            break;
+        }
+    }
+
+    if (!isIp)
+    {
+        log_line("正在解析 " + tHost + " ...");
+        std::string resolved = resolve_ipv4(tHost);
+        if (resolved.empty())
+        {
+            log_line("[X] 解析失败: " + tHost);
+            pause_exit("");
+            return 1;
+        }
+        ip = resolved;
+        log_line("[√] " + tHost + " -> " + ip);
+    }
+
+    RouteSpec r;
+    r.enabled = true;
+    r.target  = ip;
+    r.mask    = ask("  子网掩码 (默认 255.255.255.255): ");
+    if (r.mask.empty()) r.mask = "255.255.255.255";
+    r.gateway = ask("  网关地址 (如 192.168.1.1): ");
+#ifdef _WIN32
+    r.iface   = ask("  网卡索引 (如 12，用 route print 查看，可留空): ");
+#else
+    r.iface   = ask("  网卡名 (如 eth1，可留空): ");
+#endif
+
+    if (r.gateway.empty())
+    {
+        log_line("[X] 网关地址不能为空");
+        pause_exit("");
+        return 1;
+    }
+
+    std::string err;
+    if (!route_add(r, &err))
+    {
+        log_line("[X] 添加路由失败");
+        if (!err.empty()) log_line("    原因: " + err);
+        pause_exit("请右键「以管理员身份运行」（Linux 用 sudo）后重试。");
+        return 1;
+    }
+
+    log_line("");
+    log_line("[√] 已切换为网卡模式，不经过 SOCKS5");
+    log_line("[√] 游戏里直接连 " + tHost + ":" + std::to_string(tPort) + " 即可");
+    log_line("[√] 该 IP 的流量现在走你指定的网卡");
+    log_line("");
+    out_text("按回车键移除路由并退出...\n");
+    std::fflush(stdout);
+    std::string dummy;
+    std::getline(std::cin, dummy);
+    route_del(r);
+    log_line("[√] 路由已移除");
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     console_init();
@@ -873,18 +967,44 @@ int main(int argc, char** argv)
     }
     else
     {
-        out_text("目标服务器 = 你要连的 Minecraft 服务器\n");
-        out_text("代理服务器 = 你自己的 SOCKS5 代理（不是 MC 服务器）\n\n");
+        out_text("目标服务器 = 你要连的 Minecraft 服务器\n\n");
 
         tHost = ask("目标服务器地址: ");
         tPort = parse_or(ask("目标端口 (默认25565): "), 25565);
+
+        if (tHost.empty())
+        {
+            log_line("[X] 目标服务器地址不能为空");
+            pause_exit("");
+            net_done();
+            return 1;
+        }
+
+        out_text("\n请选择连接方式:\n");
+        out_text("  1 - 通过 SOCKS5 代理（需要你有代理服务器）\n");
+        out_text("  2 - 直接走指定网卡（不需要代理，需要管理员权限）\n");
+        out_text("\n请选择 (1-2): ");
+        std::fflush(stdout);
+        std::string modeStr;
+        std::getline(std::cin, modeStr);
+        while (!modeStr.empty() && (modeStr[modeStr.size() - 1] == '\r' || modeStr[modeStr.size() - 1] == '\n'))
+            modeStr.erase(modeStr.size() - 1);
+
+        if (modeStr == "2")
+        {
+            int rc = run_nic_mode(tHost, tPort);
+            net_done();
+            return rc;
+        }
+
+        out_text("\nSOCKS5代理服务器 = 你自己的代理（不是 MC 服务器）\n");
         pIp   = ask("SOCKS5代理IP/域名: ");
         pPort = parse_or(ask("SOCKS5代理端口 (默认1080): "), 1080);
         user  = ask("代理用户名 (留空=不用账密): ");
         pass  = ask("代理密码   (留空=不用账密): ");
 
-        // ---- 可选：指定 IP 走指定网卡 ----
-        out_text("\n是否为某个 IP/网段添加路由（让它走指定网卡）? (y/N): ");
+        // ---- 可选：给 SOCKS5 代理服务器的 IP 单独加路由（走专线时有用）----
+        out_text("\n是否让「SOCKS5代理服务器」的流量走指定网卡? (y/N): ");
         std::fflush(stdout);
         std::string yn;
         std::getline(std::cin, yn);
@@ -893,19 +1013,32 @@ int main(int argc, char** argv)
 
         if (!yn.empty() && (yn[0] == 'y' || yn[0] == 'Y'))
         {
+            std::string proxyIpResolved = pIp;
+            bool proxyIsIp = true;
+            for (size_t i = 0; i < pIp.size(); ++i)
+            {
+                char ch = pIp[i];
+                if (!((ch >= '0' && ch <= '9') || ch == '.')) { proxyIsIp = false; break; }
+            }
+            if (!proxyIsIp)
+            {
+                std::string resolved = resolve_ipv4(pIp);
+                if (!resolved.empty()) proxyIpResolved = resolved;
+            }
+
             st.route.enabled = true;
-            st.route.target  = ask("  目标 IP/网段 (如 1.2.3.4 或 10.0.0.0): ");
+            st.route.target  = proxyIpResolved;
             st.route.mask    = ask("  子网掩码 (默认 255.255.255.255): ");
             if (st.route.mask.empty()) st.route.mask = "255.255.255.255";
             st.route.gateway = ask("  网关地址 (如 192.168.1.1): ");
 #ifdef _WIN32
-            st.route.iface   = ask("  网卡索引 (如 12，用 route print 查看，可留空): ");
+            st.route.iface   = ask("  网卡索引 (如 12，可留空): ");
 #else
             st.route.iface   = ask("  网卡名 (如 eth1，可留空): ");
 #endif
-            if (st.route.target.empty() || st.route.gateway.empty())
+            if (st.route.gateway.empty())
             {
-                log_line("[X] 路由目标或网关为空，已跳过路由设置");
+                log_line("[X] 网关为空，已跳过路由设置");
                 st.route.enabled = false;
             }
         }

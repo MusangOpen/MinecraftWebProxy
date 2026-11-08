@@ -417,6 +417,82 @@ internal static class ProxyCore
             Log("[√] 已删除路由: " + st.RouteTarget);
     }
 
+    // 把域名解析成 IPv4（route 只能针对 IP）
+    private static string ResolveIpv4(string host)
+    {
+        IPAddress ip;
+        if (IPAddress.TryParse(host, out ip))
+            return ip.AddressFamily == AddressFamily.InterNetwork ? host : "";
+        try
+        {
+            IPAddress[] list = Dns.GetHostAddresses(host);
+            foreach (IPAddress a in list)
+                if (a.AddressFamily == AddressFamily.InterNetwork) return a.ToString();
+        }
+        catch { }
+        return "";
+    }
+
+    private static bool IsIpLiteral(string s)
+    {
+        IPAddress ip;
+        return IPAddress.TryParse(s, out ip);
+    }
+
+    // ---------------- 网卡模式：不代理，只让目标 IP 走指定网卡 ----------------
+    private static int RunNicMode(string tHost, int tPort)
+    {
+        string ip = tHost;
+        if (!IsIpLiteral(tHost))
+        {
+            Log("正在解析 " + tHost + " ...");
+            string resolved = ResolveIpv4(tHost);
+            if (resolved.Length == 0)
+            {
+                Log("[X] 解析失败: " + tHost);
+                Pause("");
+                return 1;
+            }
+            ip = resolved;
+            Log("[√] " + tHost + " -> " + ip);
+        }
+
+        State st = new State();
+        st.RouteEnabled = true;
+        st.RouteTarget  = ip;
+        st.RouteMask    = Ask("  子网掩码 (默认 255.255.255.255): ");
+        if (st.RouteMask.Length == 0) st.RouteMask = "255.255.255.255";
+        st.RouteGateway = Ask("  网关地址 (如 192.168.1.1): ");
+        st.RouteIface   = Ask("  网卡索引 (如 12，用 route print 查看，可留空): ");
+
+        if (st.RouteGateway.Length == 0)
+        {
+            Log("[X] 网关地址不能为空");
+            Pause("");
+            return 1;
+        }
+
+        string err;
+        if (!RouteAdd(st, out err))
+        {
+            Log("[X] 添加路由失败");
+            if (err.Length > 0) Log("    原因: " + err);
+            Pause("请右键「以管理员身份运行」本程序后重试。");
+            return 1;
+        }
+
+        Log("");
+        Log("[√] 已切换为网卡模式，不经过 SOCKS5");
+        Log("[√] 游戏里直接连 " + tHost + ":" + tPort + " 即可");
+        Log("[√] 该 IP 的流量现在走你指定的网卡");
+        Console.WriteLine();
+        Console.WriteLine("按回车键移除路由并退出...");
+        try { Console.ReadLine(); } catch { }
+        RouteDel(st);
+        Log("[√] 路由已移除");
+        return 0;
+    }
+
     // ---------------- 启动 / 停止 ----------------
     private static bool Start(State st, string tHost, int tPort, string pIp, int pPort, string user, string pass)
     {
@@ -571,31 +647,54 @@ internal static class ProxyCore
         else
         {
             Console.WriteLine("目标服务器 = 你要连的 Minecraft 服务器");
-            Console.WriteLine("代理服务器 = 你自己的 SOCKS5 代理（不是 MC 服务器）");
             Console.WriteLine();
 
             tHost = Ask("目标服务器地址: ");
             tPort = ParseOr(Ask("目标端口 (默认25565): "), 25565);
+
+            if (tHost.Length == 0)
+            {
+                Log("[X] 目标服务器地址不能为空");
+                Pause("");
+                return 1;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("请选择连接方式:");
+            Console.WriteLine("  1 - 通过 SOCKS5 代理（需要你有代理服务器）");
+            Console.WriteLine("  2 - 直接走指定网卡（不需要代理，需要管理员权限）");
+            Console.WriteLine();
+            string modeStr = Ask("请选择 (1-2): ");
+
+            if (modeStr == "2")
+            {
+                return RunNicMode(tHost, tPort);
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("SOCKS5代理服务器 = 你自己的代理（不是 MC 服务器）");
             pIp   = Ask("SOCKS5代理IP/域名: ");
             pPort = ParseOr(Ask("SOCKS5代理端口 (默认1080): "), 1080);
             user  = Ask("代理用户名 (留空=不用账密): ");
             pass  = Ask("代理密码   (留空=不用账密): ");
 
-            // ---- 可选：指定 IP 走指定网卡 ----
-            Console.Write("\n是否为某个 IP/网段添加路由（让它走指定网卡）? (y/N): ");
-            string yn = Console.ReadLine();
-            yn = yn == null ? "" : yn.Trim();
+            // ---- 可选：让 SOCKS5 代理服务器的流量走指定网卡 ----
+            Console.WriteLine();
+            string yn = Ask("是否让「SOCKS5代理服务器」的流量走指定网卡? (y/N): ");
             if (yn.Length > 0 && (yn[0] == 'y' || yn[0] == 'Y'))
             {
+                string proxyIp = IsIpLiteral(pIp) ? pIp : ResolveIpv4(pIp);
+                if (proxyIp.Length == 0) proxyIp = pIp;
+
                 st.RouteEnabled = true;
-                st.RouteTarget  = Ask("  目标 IP/网段 (如 1.2.3.4 或 10.0.0.0): ");
+                st.RouteTarget  = proxyIp;
                 st.RouteMask    = Ask("  子网掩码 (默认 255.255.255.255): ");
                 if (st.RouteMask.Length == 0) st.RouteMask = "255.255.255.255";
                 st.RouteGateway = Ask("  网关地址 (如 192.168.1.1): ");
-                st.RouteIface   = Ask("  网卡索引 (如 12，用 route print 查看，可留空): ");
-                if (st.RouteTarget.Length == 0 || st.RouteGateway.Length == 0)
+                st.RouteIface   = Ask("  网卡索引 (如 12，可留空): ");
+                if (st.RouteGateway.Length == 0)
                 {
-                    Log("[X] 路由目标或网关为空，已跳过路由设置");
+                    Log("[X] 网关为空，已跳过路由设置");
                     st.RouteEnabled = false;
                 }
             }
