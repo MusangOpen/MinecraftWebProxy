@@ -17,6 +17,7 @@
 //   代理核心演示.exe                                  交互输入
 //   代理核心演示.exe <目标> <目标端口> <代理IP> <代理端口> [用户] [密码]
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -38,6 +39,15 @@ internal static class ProxyCore
         public int ListenPort = 25565;
         public int ConnCount;
         public string LastError = "";
+
+        // 路由：让指定 IP/网段走指定网卡
+        public bool RouteEnabled;
+        public string RouteTarget = "";
+        public string RouteMask = "";
+        public string RouteGateway = "";
+        public string RouteIface = "";
+
+        public int FailStage;   // 0=无 1=路由失败 2=连接失败
     }
 
     private static void Log(string s) { Console.WriteLine(s); }
@@ -344,6 +354,69 @@ internal static class ProxyCore
         catch { }
     }
 
+    // ---------------- 路由：让指定 IP/网段走指定网卡 ----------------
+    //   Windows: route add <target> mask <mask> <gateway> [if <index>]
+    //   Linux  : ip route add <cidr> via <gateway> [dev <iface>]
+    private static int RunShell(string cmd, bool quiet)
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo("cmd.exe", "/c " + cmd);
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = quiet;
+            if (quiet)
+            {
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+            }
+            using (Process p = Process.Start(psi))
+            {
+                if (quiet) { p.StandardOutput.ReadToEnd(); p.StandardError.ReadToEnd(); }
+                p.WaitForExit();
+                return p.ExitCode;
+            }
+        }
+        catch { return -1; }
+    }
+
+    private static bool RouteAdd(State st, out string err)
+    {
+        err = "";
+        if (!st.RouteEnabled) return true;
+        if (st.RouteTarget.Length == 0 || st.RouteGateway.Length == 0)
+        {
+            err = "路由参数不完整（目标 IP 和网关必填）";
+            return false;
+        }
+
+        // 先删再建，保证重复运行不会因为「已存在」而失败
+        RunShell("route delete " + st.RouteTarget, true);
+
+        string cmd = "route add " + st.RouteTarget;
+        if (st.RouteMask.Length > 0) cmd += " mask " + st.RouteMask;
+        cmd += " " + st.RouteGateway;
+        if (st.RouteIface.Length > 0) cmd += " if " + st.RouteIface;
+
+        int rc = RunShell(cmd, false);
+        if (rc != 0)
+        {
+            err = "route add 失败（需要以管理员身份运行）: " + cmd;
+            return false;
+        }
+        Log("[√] 已添加路由: " + st.RouteTarget
+            + (st.RouteMask.Length > 0 ? " mask " + st.RouteMask : "")
+            + " -> " + st.RouteGateway
+            + (st.RouteIface.Length > 0 ? " if " + st.RouteIface : ""));
+        return true;
+    }
+
+    private static void RouteDel(State st)
+    {
+        if (!st.RouteEnabled || st.RouteTarget.Length == 0) return;
+        if (RunShell("route delete " + st.RouteTarget, true) == 0)
+            Log("[√] 已删除路由: " + st.RouteTarget);
+    }
+
     // ---------------- 启动 / 停止 ----------------
     private static bool Start(State st, string tHost, int tPort, string pIp, int pPort, string user, string pass)
     {
@@ -358,13 +431,29 @@ internal static class ProxyCore
         Log("代理服务器 : " + pIp + ":" + pPort
             + ((user.Length > 0 || pass.Length > 0) ? " (用户名密码)" : " (无认证)"));
         Log("");
+
+        // 路由要在测试连接之前生效
+        if (st.RouteEnabled)
+        {
+            string rerr;
+            if (!RouteAdd(st, out rerr))
+            {
+                st.FailStage = 1;
+                Log("[X] 添加路由失败");
+                if (rerr.Length > 0) Log("    原因: " + rerr);
+                return false;
+            }
+        }
+
         Log("正在测试连接...");
 
         Socket t = ConnectSocks5(st);
         if (t == null)
         {
+            st.FailStage = 2;
             Log("[X] 连接测试失败");
             if (st.LastError.Length > 0) Log("    原因: " + st.LastError);
+            RouteDel(st);
             return false;
         }
         t.Close();
@@ -413,6 +502,7 @@ internal static class ProxyCore
         if (ls != null) { try { ls.Close(); } catch { } }
         st.Listen = null;
         HostsRemove();
+        RouteDel(st);
         Thread.Sleep(300);
         Log("[√] 代理已停止");
     }
@@ -467,6 +557,16 @@ internal static class ProxyCore
             pPort = ParseOr(args[3], 0);
             user  = args.Length >= 5 ? args[4] : "";
             pass  = args.Length >= 6 ? args[5] : "";
+
+            // 可选路由参数：<路由IP> <掩码> <网关> [网卡索引]
+            if (args.Length >= 10)
+            {
+                st.RouteEnabled = true;
+                st.RouteTarget  = args[6];
+                st.RouteMask    = args[7];
+                st.RouteGateway = args[8];
+                st.RouteIface   = args.Length >= 11 ? args[9] : "";
+            }
         }
         else
         {
@@ -480,6 +580,25 @@ internal static class ProxyCore
             pPort = ParseOr(Ask("SOCKS5代理端口 (默认1080): "), 1080);
             user  = Ask("代理用户名 (留空=不用账密): ");
             pass  = Ask("代理密码   (留空=不用账密): ");
+
+            // ---- 可选：指定 IP 走指定网卡 ----
+            Console.Write("\n是否为某个 IP/网段添加路由（让它走指定网卡）? (y/N): ");
+            string yn = Console.ReadLine();
+            yn = yn == null ? "" : yn.Trim();
+            if (yn.Length > 0 && (yn[0] == 'y' || yn[0] == 'Y'))
+            {
+                st.RouteEnabled = true;
+                st.RouteTarget  = Ask("  目标 IP/网段 (如 1.2.3.4 或 10.0.0.0): ");
+                st.RouteMask    = Ask("  子网掩码 (默认 255.255.255.255): ");
+                if (st.RouteMask.Length == 0) st.RouteMask = "255.255.255.255";
+                st.RouteGateway = Ask("  网关地址 (如 192.168.1.1): ");
+                st.RouteIface   = Ask("  网卡索引 (如 12，用 route print 查看，可留空): ");
+                if (st.RouteTarget.Length == 0 || st.RouteGateway.Length == 0)
+                {
+                    Log("[X] 路由目标或网关为空，已跳过路由设置");
+                    st.RouteEnabled = false;
+                }
+            }
         }
 
         if (tHost.Length == 0 || pIp.Length == 0 || tPort <= 0 || tPort > 65535 || pPort <= 0 || pPort > 65535)
@@ -506,10 +625,18 @@ internal static class ProxyCore
 
         if (!Start(st, tHost, tPort, pIp, pPort, user, pass))
         {
-            Pause("常见原因：\n"
-                + "  1. 「SOCKS5代理IP/端口」填成了 Minecraft 服务器地址，应该填你自己的 SOCKS5 代理\n"
-                + "  2. 代理服务器没开、端口不对、被防火墙拦了\n"
-                + "  3. 代理要求账号密码但没填");
+            if (st.FailStage == 1)
+            {
+                Pause("路由没加上。\n"
+                    + "  请右键「以管理员身份运行」本程序，或用管理员 CMD 手动执行上面的 route 命令");
+            }
+            else
+            {
+                Pause("常见原因：\n"
+                    + "  1. 「SOCKS5代理IP/端口」填成了 Minecraft 服务器地址，应该填你自己的 SOCKS5 代理\n"
+                    + "  2. 代理服务器没开、端口不对、被防火墙拦了\n"
+                    + "  3. 代理要求账号密码但没填");
+            }
             return 1;
         }
 

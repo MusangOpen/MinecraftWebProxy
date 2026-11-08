@@ -204,6 +204,20 @@ static void pause_exit(const std::string& hint)
 }
 
 // ===========================================================================
+//  路由配置：让指定 IP/网段走指定网卡
+//    Windows: route add <target> mask <mask> <gateway> [if <index>]
+//    Linux  : ip route add <cidr> via <gateway> [dev <iface>]
+// ===========================================================================
+struct RouteSpec
+{
+    bool        enabled = false;
+    std::string target;      // 1.2.3.4 或 10.0.0.0
+    std::string mask;        // 255.255.255.255（Windows 用）
+    std::string gateway;     // 192.168.1.1
+    std::string iface;       // Windows: 网卡索引 12；Linux: 网卡名 eth1
+};
+
+// ===========================================================================
 //  代理状态
 // ===========================================================================
 struct ProxyState
@@ -218,6 +232,8 @@ struct ProxyState
     int               targetPort{ 0 };
     int               listenPort{ 25565 };
     std::atomic<int>  connCount{ 0 };
+    RouteSpec         route;
+    int               failStage{ 0 };   // 0=无 1=路由失败 2=连接失败
 };
 
 static const char* socks5_reply_text(unsigned char rep)
@@ -613,6 +629,100 @@ static void hosts_remove_entries()
 }
 
 // ---------------------------------------------------------------------------
+//  路由：让指定 IP/网段走指定网卡
+// ---------------------------------------------------------------------------
+static int run_shell(const std::string& cmd, bool quiet)
+{
+    std::string c = cmd;
+#ifdef _WIN32
+    if (quiet) c += " > nul 2>&1";
+#else
+    if (quiet) c += " > /dev/null 2>&1";
+#endif
+    return std::system(c.c_str());
+}
+
+// 255.255.255.0 -> 24（Linux 的 ip route 用前缀长度）
+static int mask_to_prefix(const std::string& mask)
+{
+    unsigned int a = 0, b = 0, c2 = 0, d = 0;
+    if (std::sscanf(mask.c_str(), "%u.%u.%u.%u", &a, &b, &c2, &d) != 4) return 32;
+    unsigned int m = (a << 24) | (b << 16) | (c2 << 8) | d;
+    int n = 0;
+    while (n < 32 && (m & 0x80000000u))
+    {
+        ++n;
+        m <<= 1;
+    }
+    return n;
+}
+
+static bool route_add(const RouteSpec& r, std::string* err)
+{
+    if (!r.enabled) return true;
+    if (r.target.empty() || r.gateway.empty())
+    {
+        if (err) *err = "路由参数不完整（目标 IP 和网关必填）";
+        return false;
+    }
+
+#ifdef _WIN32
+    // 先删再建，保证重复运行不会因为「已存在」而失败
+    run_shell("route delete " + r.target, true);
+
+    std::string cmd = "route add " + r.target;
+    if (!r.mask.empty()) cmd += " mask " + r.mask;
+    cmd += " " + r.gateway;
+    if (!r.iface.empty()) cmd += " if " + r.iface;
+
+    if (run_shell(cmd, false) != 0)
+    {
+        if (err) *err = "route add 失败（需要以管理员身份运行）: " + cmd;
+        return false;
+    }
+    log_line("[√] 已添加路由: " + r.target +
+             (r.mask.empty() ? "" : " mask " + r.mask) +
+             " -> " + r.gateway +
+             (r.iface.empty() ? "" : " if " + r.iface));
+#else
+    std::string cidr = r.target;
+    if (cidr.find('/') == std::string::npos)
+        cidr += "/" + std::to_string(mask_to_prefix(r.mask.empty() ? "255.255.255.255" : r.mask));
+
+    run_shell("ip route del " + cidr, true);
+
+    std::string cmd = "ip route add " + cidr + " via " + r.gateway;
+    if (!r.iface.empty()) cmd += " dev " + r.iface;
+
+    if (run_shell(cmd, false) != 0)
+    {
+        if (err) *err = "ip route add 失败（需要 root 权限）: " + cmd;
+        return false;
+    }
+    log_line("[√] 已添加路由: " + cidr + " via " + r.gateway +
+             (r.iface.empty() ? "" : " dev " + r.iface));
+#endif
+
+    return true;
+}
+
+static void route_del(const RouteSpec& r)
+{
+    if (!r.enabled || r.target.empty()) return;
+
+#ifdef _WIN32
+    if (run_shell("route delete " + r.target, true) == 0)
+        log_line("[√] 已删除路由: " + r.target);
+#else
+    std::string cidr = r.target;
+    if (cidr.find('/') == std::string::npos)
+        cidr += "/" + std::to_string(mask_to_prefix(r.mask.empty() ? "255.255.255.255" : r.mask));
+    if (run_shell("ip route del " + cidr, true) == 0)
+        log_line("[√] 已删除路由: " + cidr);
+#endif
+}
+
+// ---------------------------------------------------------------------------
 //  启动 / 停止
 // ---------------------------------------------------------------------------
 static bool start_proxy(ProxyState* st,
@@ -638,14 +748,30 @@ static bool start_proxy(ProxyState* st,
     log_line("代理服务器 : " + proxyIp + ":" + std::to_string(proxyPort) +
              ((!user.empty() || !pass.empty()) ? " (用户名密码)" : " (无认证)"));
     log_line("");
+
+    // 路由要在测试连接之前生效，否则测试走的还是旧路由
+    if (st->route.enabled)
+    {
+        std::string rerr;
+        if (!route_add(st->route, &rerr))
+        {
+            st->failStage = 1;
+            log_line("[X] 添加路由失败");
+            if (!rerr.empty()) log_line("    原因: " + rerr);
+            return false;
+        }
+    }
+
     log_line("正在测试连接...");
 
     std::string err;
     net_sock t = socks5_connect(*st, &err);
     if (t == kInvalidSock)
     {
+        st->failStage = 2;
         log_line("[X] 连接测试失败");
         if (!err.empty()) log_line("    原因: " + err);
+        route_del(st->route);      // 失败也要把刚加的路由撤掉
         return false;
     }
     net_close(t);
@@ -678,6 +804,7 @@ static void stop_proxy(ProxyState* st)
     st->listenSock = kInvalidSock;
 
     hosts_remove_entries();
+    route_del(st->route);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     log_line("[√] 代理已停止");
 }
@@ -733,6 +860,16 @@ int main(int argc, char** argv)
         pPort = parse_or(argv[4], 0);
         user  = (argc >= 6) ? argv[5] : "";
         pass  = (argc >= 7) ? argv[6] : "";
+
+        // 可选路由参数：<路由IP> <掩码> <网关> [网卡]
+        if (argc >= 10)
+        {
+            st.route.enabled = true;
+            st.route.target  = argv[7];
+            st.route.mask    = argv[8];
+            st.route.gateway = argv[9];
+            st.route.iface   = (argc >= 11) ? argv[10] : "";
+        }
     }
     else
     {
@@ -745,6 +882,33 @@ int main(int argc, char** argv)
         pPort = parse_or(ask("SOCKS5代理端口 (默认1080): "), 1080);
         user  = ask("代理用户名 (留空=不用账密): ");
         pass  = ask("代理密码   (留空=不用账密): ");
+
+        // ---- 可选：指定 IP 走指定网卡 ----
+        out_text("\n是否为某个 IP/网段添加路由（让它走指定网卡）? (y/N): ");
+        std::fflush(stdout);
+        std::string yn;
+        std::getline(std::cin, yn);
+        while (!yn.empty() && (yn[yn.size() - 1] == '\r' || yn[yn.size() - 1] == '\n'))
+            yn.erase(yn.size() - 1);
+
+        if (!yn.empty() && (yn[0] == 'y' || yn[0] == 'Y'))
+        {
+            st.route.enabled = true;
+            st.route.target  = ask("  目标 IP/网段 (如 1.2.3.4 或 10.0.0.0): ");
+            st.route.mask    = ask("  子网掩码 (默认 255.255.255.255): ");
+            if (st.route.mask.empty()) st.route.mask = "255.255.255.255";
+            st.route.gateway = ask("  网关地址 (如 192.168.1.1): ");
+#ifdef _WIN32
+            st.route.iface   = ask("  网卡索引 (如 12，用 route print 查看，可留空): ");
+#else
+            st.route.iface   = ask("  网卡名 (如 eth1，可留空): ");
+#endif
+            if (st.route.target.empty() || st.route.gateway.empty())
+            {
+                log_line("[X] 路由目标或网关为空，已跳过路由设置");
+                st.route.enabled = false;
+            }
+        }
     }
 
     if (tHost.empty() || pIp.empty() || tPort <= 0 || tPort > 65535 || pPort <= 0 || pPort > 65535)
@@ -773,10 +937,19 @@ int main(int argc, char** argv)
 
     if (!start_proxy(&st, tHost, tPort, pIp, pPort, user, pass))
     {
-        pause_exit("常见原因：\n"
-                   "  1. 「SOCKS5代理IP/端口」填成了 Minecraft 服务器地址，应该填你自己的 SOCKS5 代理\n"
-                   "  2. 代理服务器没开、端口不对、被防火墙拦了\n"
-                   "  3. 代理要求账号密码但没填");
+        if (st.failStage == 1)
+        {
+            pause_exit("路由没加上。\n"
+                       "  Windows: 右键「以管理员身份运行」本程序，或用管理员 CMD 手动执行上面的 route 命令\n"
+                       "  Linux  : 用 sudo 运行");
+        }
+        else
+        {
+            pause_exit("常见原因：\n"
+                       "  1. 「SOCKS5代理IP/端口」填成了 Minecraft 服务器地址，应该填你自己的 SOCKS5 代理\n"
+                       "  2. 代理服务器没开、端口不对、被防火墙拦了\n"
+                       "  3. 代理要求账号密码但没填");
+        }
         net_done();
         return 1;
     }
